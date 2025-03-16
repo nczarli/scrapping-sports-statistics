@@ -3,129 +3,104 @@ import io
 import csv
 import logging
 from datetime import datetime
-import time
 import boto3
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium.webdriver.chrome.options import Options
 from bs4 import BeautifulSoup
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.INFO)
 
-class NBATeamStatsScraper:
-    """
-    A class to scrape NBA team statistics and upload to S3.
-    """
+
+class SeleniumScraper:
+    """Handles web scraping using Selenium."""
 
     def __init__(self, url):
         self.url = url
-        self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
-        self.logger = logging.getLogger(__name__)
-        self.s3_bucket = os.getenv('S3_BUCKET_NAME')
-        if not self.s3_bucket:
-            raise ValueError("S3_BUCKET_NAME environment variable not set")
-        self.s3_client = boto3.client('s3')
+        self.driver = None
 
-    def fetch_data(self):
-        """
-        Fetch HTML content using Selenium with headless Chrome.
-        """
-        try:
-            chrome_options = Options()
-            chrome_options.add_argument("--headless")
-            chrome_options.add_argument("--disable-gpu")
-            chrome_options.add_argument("--window-size=1920x1080")
-            chrome_options.add_argument(f"user-agent={self.headers['User-Agent']}")
+    def _initialize_driver(self):
+        """Initialize Selenium WebDriver with headless Chrome."""
+        options = Options()
+        options.add_argument("--headless")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--window-size=1920x1080")
+        options.binary_location = "/opt/python/bin/headless-chromium"
+        service = Service("/opt/python/bin/chromedriver")
 
-            # Configure for AWS Lambda if detected
-            if os.environ.get('AWS_EXECUTION_ENV'):
-                chrome_options.binary_location = "/opt/python/bin/headless-chromium"
-                service = Service(executable_path="/opt/python/bin/chromedriver")
-            else:
-                service = Service(ChromeDriverManager().install())
+        self.driver = webdriver.Chrome(service=service, options=options)
 
-            driver = webdriver.Chrome(service=service, options=chrome_options)
-            driver.get(self.url)
-            
-            # Wait for the table to load
-            WebDriverWait(driver, 30).until(
-                EC.presence_of_element_located((By.CLASS_NAME, "Crom_table__p1iZz"))
-            )
-            
-            html = driver.page_source
-            driver.quit()
-            return html
-        except Exception as e:
-            self.logger.error(f"Failed to fetch data: {e}")
-            return None
+    def fetch_html(self):
+        """Fetches HTML content from the given URL."""
+        self._initialize_driver()
+        self.driver.get(self.url)
 
-    def parse_data(self, html):
-        """
-        Parse HTML to extract team statistics.
-        """
+        WebDriverWait(self.driver, 30).until(
+            EC.presence_of_element_located((By.CLASS_NAME, "Crom_table__p1iZz"))
+        )
+
+        html = self.driver.page_source
+        self.driver.quit()
+        return html
+
+
+class DataParser:
+    """Parses HTML content to extract structured data."""
+
+    @staticmethod
+    def parse(html):
+        """Extracts table data using BeautifulSoup."""
         soup = BeautifulSoup(html, "html.parser")
         table = soup.find("table", class_="Crom_table__p1iZz")
-        if not table:
-            self.logger.error("Table not found.")
-            return None
 
         headers = [th.get_text(strip=True) for th in table.find_all("th")]
-        rows = table.find_all("tr")[1:]
-        data = []
-        for row in rows:
-            cols = [col.get_text(strip=True) for col in row.find_all("td")]
-            if cols:
-                data.append(cols)
-        return headers, data
+        rows = [[td.get_text(strip=True) for td in row.find_all("td")] for row in table.find_all("tr")[1:]]
 
-    def generate_csv_data(self, headers, data):
-        """
-        Generate CSV content as a string.
-        """
-        output = io.StringIO()
-        writer = csv.writer(output)
+        return headers, rows
+
+
+class S3Uploader:
+    """Handles uploading files to S3."""
+
+    def __init__(self, bucket_name):
+        self.bucket_name = bucket_name
+        self.s3_client = boto3.client("s3")
+
+    def upload_csv(self, headers, rows):
+        """Uploads extracted data as a CSV file to S3."""
+        csv_buffer = io.StringIO()
+        writer = csv.writer(csv_buffer)
         writer.writerow(headers)
-        writer.writerows(data)
-        return output.getvalue()
+        writer.writerows(rows)
 
-    def upload_to_s3(self, csv_data, filename):
-        """
-        Upload CSV data to S3 bucket.
-        """
-        try:
-            self.s3_client.put_object(
-                Bucket=self.s3_bucket,
-                Key=filename,
-                Body=csv_data.encode('utf-8'),
-                ContentType='text/csv'
-            )
-            self.logger.info(f"Uploaded {filename} to S3 bucket {self.s3_bucket}")
-        except Exception as e:
-            self.logger.error(f"Failed to upload to S3: {e}")
+        filename = f"nba_team_stats_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        self.s3_client.put_object(Bucket=self.bucket_name, Key=filename, Body=csv_buffer.getvalue())
+
+        logging.info(f"Uploaded file {filename} to S3 bucket {self.bucket_name}")
+
+
+class NBATeamStatsPipeline:
+    """Pipeline to coordinate scraping, parsing, and uploading."""
+
+    def __init__(self):
+        self.scraper = SeleniumScraper("https://www.nba.com/stats/teams/traditional")
+        self.uploader = S3Uploader(os.getenv("S3_BUCKET_NAME"))
 
     def run(self):
-        """
-        Execute scraping and upload to S3.
-        """
-        self.logger.info("Starting NBA team stats scraper...")
-        html = self.fetch_data()
-        if html:
-            result = self.parse_data(html)
-            if result:
-                headers, data = result
-                csv_data = self.generate_csv_data(headers, data)
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = f"nba_team_stats_{timestamp}.csv"
-                self.upload_to_s3(csv_data, filename)
-        self.logger.info("Scraping completed.")
+        """Runs the full pipeline: fetch, parse, and upload data."""
+        html = self.scraper.fetch_html()
+        headers, rows = DataParser.parse(html)
 
-if __name__ == "__main__":
-    url = "https://www.nba.com/stats/teams/traditional"
-    scraper = NBATeamStatsScraper(url)
-    scraper.run()
+        if headers and rows:
+            self.uploader.upload_csv(headers, rows)
+            return {"statusCode": 200, "body": "Scraping completed successfully."}
+        else:
+            return {"statusCode": 500, "body": "Failed to extract data."}
+
+
+def lambda_handler(event, context):
+    pipeline = NBATeamStatsPipeline()
+    return pipeline.run()
