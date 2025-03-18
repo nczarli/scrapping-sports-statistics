@@ -11,8 +11,11 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from bs4 import BeautifulSoup
+import time
+import tempfile
 
-logging.basicConfig(level=logging.INFO)
+
+logging.basicConfig(level=print)
 
 
 class SeleniumScraper:
@@ -21,27 +24,52 @@ class SeleniumScraper:
     def __init__(self, url):
         self.url = url
         self.driver = None
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
 
     def _initialize_driver(self):
-        """Initialize Selenium WebDriver with headless Chrome."""
-        options = Options()
-        options.add_argument("--headless")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--window-size=1920x1080")
-        options.binary_location = "/opt/python/bin/headless-chromium"
-        service = Service("/opt/python/bin/chromedriver")
+        chrome_options = Options()
+        chrome_options.add_argument("--headless=new")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--disable-dev-tools")
+        chrome_options.add_argument("--no-zygote")
+        chrome_options.add_argument("--single-process")
+        chrome_options.add_argument(f"--user-data-dir={tempfile.mkdtemp()}")
+        chrome_options.add_argument(f"--data-path={tempfile.mkdtemp()}")
+        chrome_options.add_argument(f"--disk-cache-dir={tempfile.mkdtemp()}")
+        chrome_options.add_argument("--remote-debugging-pipe")
+        chrome_options.add_argument("--verbose")
+        chrome_options.add_argument("--log-path=/tmp")
+        chrome_options.binary_location = "/opt/chrome/chrome-linux64/chrome"
+        chrome_options.add_argument(f"user-agent={self.headers['User-Agent']}")
 
-        self.driver = webdriver.Chrome(service=service, options=options)
+        service = Service(
+            executable_path="/opt/chrome-driver/chromedriver-linux64/chromedriver",
+            service_log_path="/tmp/chromedriver.log"
+        )
+
+        self.driver = webdriver.Chrome(
+            service=service,
+            options=chrome_options
+        )
+ 
+        
 
     def fetch_html(self):
         """Fetches HTML content from the given URL."""
         self._initialize_driver()
         self.driver.get(self.url)
 
-        WebDriverWait(self.driver, 30).until(
-            EC.presence_of_element_located((By.CLASS_NAME, "Crom_table__p1iZz"))
-        )
+        time.sleep(5)
 
+        self.driver.save_screenshot("screenshot.png")
+
+        print(f"Waiting for page to load with table class")
+
+    
         html = self.driver.page_source
         self.driver.quit()
         return html
@@ -79,7 +107,7 @@ class S3Uploader:
         filename = f"nba_team_stats_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         self.s3_client.put_object(Bucket=self.bucket_name, Key=filename, Body=csv_buffer.getvalue())
 
-        logging.info(f"Uploaded file {filename} to S3 bucket {self.bucket_name}")
+        print(f"Uploaded file {filename} to S3 bucket {self.bucket_name}")
 
 
 class NBATeamStatsPipeline:
@@ -95,12 +123,15 @@ class NBATeamStatsPipeline:
         headers, rows = DataParser.parse(html)
 
         if headers and rows:
-            self.uploader.upload_csv(headers, rows)
+            print('Uploading CSV')
+            # self.uploader.upload_csv(headers, rows)
             return {"statusCode": 200, "body": "Scraping completed successfully."}
         else:
             return {"statusCode": 500, "body": "Failed to extract data."}
 
 
-def lambda_handler(event, context):
+def handler(event, context):
+    print(f"Starting the NBA Team Stats Pipeline")
     pipeline = NBATeamStatsPipeline()
     return pipeline.run()
+    
